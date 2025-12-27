@@ -1,4 +1,4 @@
-name: Build APK from Zip
+name: Manual Build (No Gradle)
 
 on: [push, workflow_dispatch]
 
@@ -9,33 +9,74 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
-    # 1. Unzip the source code (If you uploaded 'source_code.zip')
-    - name: Unzip Project
+    # 1. Unzip Source Code
+    - name: Prepare Source Code
       run: |
-        if [ -f source_code.zip ]; then
-          unzip source_code.zip
-          # Move files to root if they are inside a subfolder
-          mv Wildlife_Cinema_Android_Studio_Project/* . || true
-        fi
+        # Change this to your actual zip filename!
+        unzip source_code.zip
+        
+        # Move files to a standard folder 'project'
+        mkdir project
+        # Move everything from the unzipped folder into 'project'
+        # (Wildcard moves whatever folder came out of the zip)
+        mv */* project/ || mv * project/ 2>/dev/null || true
+        
+        # Verify structure
+        find project -maxdepth 3
 
-    # 2. Set up Java
-    - name: Set up JDK 17
-      uses: actions/setup-java@v3
-      with:
-        java-version: '17'
-        distribution: 'temurin'
+    # 2. Install Build Tools
+    - name: Setup Build Tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y aapt android-sdk-build-tools
 
-    # 3. Make gradlew executable
-    - name: Grant execute permission for gradlew
-      run: chmod +x gradlew
+    # 3. Download Android SDK (android.jar)
+    - name: Download SDK Platform
+      run: |
+        curl -L -o android.jar https://github.com/Sable/android-platforms/raw/master/android-30/android.jar
 
-    # 4. Build the APK
-    - name: Build with Gradle
-      run: ./gradlew assembleDebug
+    # 4. Build the APK Manually
+    - name: Compile and Package
+      run: |
+        # CONFIGURATION
+        ANDROID_JAR="android.jar"
+        PROJECT_ROOT="project"
+        
+        # Find path to Manifest and Res
+        MANIFEST=$(find $PROJECT_ROOT -name "AndroidManifest.xml" | head -n 1)
+        RES_DIR=$(find $PROJECT_ROOT -type d -name "res" | head -n 1)
+        SRC_DIR=$(find $PROJECT_ROOT -type d -name "java" | head -n 1)
+        
+        echo "Found Manifest: $MANIFEST"
+        echo "Found Res: $RES_DIR"
+        
+        # Create Build Dir
+        mkdir -p build/gen build/obj build/bin
+        
+        # 1. Generate R.java
+        aapt package -f -m -J build/gen -M "$MANIFEST" -S "$RES_DIR" -I "$ANDROID_JAR"
+        
+        # 2. Compile Java
+        javac -d build/obj -classpath "$ANDROID_JAR" -source 1.8 -target 1.8 $(find build/gen -name "*.java") $(find $SRC_DIR -name "*.java")
+        
+        # 3. Convert to DEX
+        # (We use the build-tools dx)
+        DX_TOOL=$(find /usr/lib/android-sdk/build-tools -name dx | head -n 1)
+        $DX_TOOL --dex --output=build/bin/classes.dex build/obj
+        
+        # 4. Package APK
+        aapt package -f -M "$MANIFEST" -S "$RES_DIR" -I "$ANDROID_JAR" -F build/bin/app.unsigned.apk build/bin
+        
+        # 5. Sign APK (Debug Key)
+        keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -dname "CN=Android Debug,O=Android,C=US"
+        jarsigner -verbose -sigalg SHA1withRSA -digestalg SHA1 -keystore debug.keystore -storepass android build/bin/app.unsigned.apk androiddebugkey
+        
+        # 6. Zip Align
+        zipalign -v 4 build/bin/app.unsigned.apk app-debug.apk
 
-    # 5. Upload the APK so you can download it
+    # 5. Upload Result
     - name: Upload APK
       uses: actions/upload-artifact@v3
       with:
-        name: Wildlife-Cinema-APK
-        path: app/build/outputs/apk/debug/app-debug.apk
+        name: Manual-Build-APK
+        path: app-debug.apk
