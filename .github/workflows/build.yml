@@ -1,4 +1,4 @@
-name: Manual Build (No Gradle)
+name: Debug and Build
 
 on: [push, workflow_dispatch]
 
@@ -9,74 +9,104 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
-    # 1. Unzip Source Code
-    - name: Prepare Source Code
+    # 1. Unzip and SHOW structure (Debugging)
+    - name: Debug File Structure
       run: |
-        # Change this to your actual zip filename!
-        unzip source_code.zip
+        echo "=== INITIAL FILES ==="
+        ls -R
         
-        # Move files to a standard folder 'project'
-        mkdir project
-        # Move everything from the unzipped folder into 'project'
-        # (Wildcard moves whatever folder came out of the zip)
-        mv */* project/ || mv * project/ 2>/dev/null || true
+        echo "=== UNZIPPING ==="
+        if [ -f *.zip ]; then
+            unzip -o *.zip
+        else
+            echo "No zip file found! Did you upload source_code.zip?"
+        fi
         
-        # Verify structure
-        find project -maxdepth 3
+        echo "=== FILES AFTER UNZIP ==="
+        find . -maxdepth 4 -not -path '*/.*'
 
-    # 2. Install Build Tools
+    # 2. Organize Files for Manual Build
+    - name: Reorganize Files
+      run: |
+        mkdir -p MANUAL_PROJECT/res/values
+        mkdir -p MANUAL_PROJECT/src
+        
+        # FIND AND MOVE MANIFEST
+        MANIFEST=$(find . -name "AndroidManifest.xml" | head -n 1)
+        if [ -z "$MANIFEST" ]; then
+            echo "ERROR: No AndroidManifest.xml found!"
+            exit 1
+        fi
+        cp "$MANIFEST" MANUAL_PROJECT/
+        
+        # FIND AND MOVE RESOURCES (res folder)
+        # Look for a folder named 'res' that has 'layout' or 'values' inside
+        RES_DIR=$(find . -type d -name "res" | grep -v "build" | head -n 1)
+        if [ -n "$RES_DIR" ]; then
+            cp -r "$RES_DIR"/* MANUAL_PROJECT/res/
+        else
+            echo "WARNING: No res folder found. Creating empty layout."
+            mkdir -p MANUAL_PROJECT/res/layout
+            echo '<?xml version="1.0" encoding="utf-8"?><LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="match_parent"><TextView android:text="Hello" android:layout_width="wrap_content" android:layout_height="wrap_content"/></LinearLayout>' > MANUAL_PROJECT/res/layout/activity_main.xml
+        fi
+        
+        # FIND AND MOVE JAVA CODE
+        # Find any folder named 'java' or just copy all .java files to src
+        JAVA_SRC=$(find . -type d -name "java" | grep -v "build" | head -n 1)
+        if [ -n "$JAVA_SRC" ]; then
+             cp -r "$JAVA_SRC"/* MANUAL_PROJECT/src/
+        else
+             # Fallback: Find individual java files
+             find . -name "*.java" -exec cp --parents {} MANUAL_PROJECT/src/ ;
+        fi
+        
+        # REMOVE KOTLIN FILES (Manual build supports Java only)
+        find MANUAL_PROJECT/src -name "*.kt" -delete
+        
+        echo "=== FINAL PROJECT STRUCTURE ==="
+        find MANUAL_PROJECT
+
+    # 3. Setup Tools
     - name: Setup Build Tools
       run: |
         sudo apt-get update
-        sudo apt-get install -y aapt android-sdk-build-tools
-
-    # 3. Download Android SDK (android.jar)
-    - name: Download SDK Platform
-      run: |
+        sudo apt-get install -y aapt android-sdk-build-tools openjdk-17-jdk
         curl -L -o android.jar https://github.com/Sable/android-platforms/raw/master/android-30/android.jar
 
-    # 4. Build the APK Manually
+    # 4. Compile (Manual Method)
     - name: Compile and Package
       run: |
-        # CONFIGURATION
-        ANDROID_JAR="android.jar"
-        PROJECT_ROOT="project"
+        cd MANUAL_PROJECT
+        ANDROID_JAR="../../android.jar"
         
-        # Find path to Manifest and Res
-        MANIFEST=$(find $PROJECT_ROOT -name "AndroidManifest.xml" | head -n 1)
-        RES_DIR=$(find $PROJECT_ROOT -type d -name "res" | head -n 1)
-        SRC_DIR=$(find $PROJECT_ROOT -type d -name "java" | head -n 1)
+        # Clean up theme issues in Manifest
+        sed -i 's|@style/Theme.AppCompat.*|@android:style/Theme.DeviceDefault|g' AndroidManifest.xml
         
-        echo "Found Manifest: $MANIFEST"
-        echo "Found Res: $RES_DIR"
+        mkdir -p gen obj bin
         
-        # Create Build Dir
-        mkdir -p build/gen build/obj build/bin
+        # R.java
+        aapt package -f -m -J gen -M AndroidManifest.xml -S res -I "$ANDROID_JAR"
         
-        # 1. Generate R.java
-        aapt package -f -m -J build/gen -M "$MANIFEST" -S "$RES_DIR" -I "$ANDROID_JAR"
+        # Java
+        javac -d obj -cp "$ANDROID_JAR" -source 1.8 -target 1.8 $(find gen -name "*.java") $(find src -name "*.java")
         
-        # 2. Compile Java
-        javac -d build/obj -classpath "$ANDROID_JAR" -source 1.8 -target 1.8 $(find build/gen -name "*.java") $(find $SRC_DIR -name "*.java")
-        
-        # 3. Convert to DEX
-        # (We use the build-tools dx)
+        # Dex
         DX_TOOL=$(find /usr/lib/android-sdk/build-tools -name dx | head -n 1)
-        $DX_TOOL --dex --output=build/bin/classes.dex build/obj
+        $DX_TOOL --dex --output=bin/classes.dex obj
         
-        # 4. Package APK
-        aapt package -f -M "$MANIFEST" -S "$RES_DIR" -I "$ANDROID_JAR" -F build/bin/app.unsigned.apk build/bin
+        # APK
+        aapt package -f -M AndroidManifest.xml -S res -I "$ANDROID_JAR" -F bin/app.unsigned.apk bin
         
-        # 5. Sign APK (Debug Key)
+        # Sign
         keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -dname "CN=Android Debug,O=Android,C=US"
-        jarsigner -verbose -sigalg SHA1withRSA -digestalg SHA1 -keystore debug.keystore -storepass android build/bin/app.unsigned.apk androiddebugkey
+        jarsigner -verbose -sigalg SHA1withRSA -digestalg SHA1 -keystore debug.keystore -storepass android bin/app.unsigned.apk androiddebugkey
         
-        # 6. Zip Align
-        zipalign -v 4 build/bin/app.unsigned.apk app-debug.apk
+        # Zip Align
+        zipalign -v 4 bin/app.unsigned.apk app-debug.apk
 
-    # 5. Upload Result
+    # 5. Upload
     - name: Upload APK
       uses: actions/upload-artifact@v3
       with:
-        name: Manual-Build-APK
-        path: app-debug.apk
+        name: Debug-Build-APK
+        path: MANUAL_PROJECT/app-debug.apk
